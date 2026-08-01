@@ -1,0 +1,45 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+
+# pi local state
+.pi/
+
+# dependencies
+node_modules/
+
+# build outputs
+dist/
+build/
+*.tsbuildinfo
+
+# Python (skills: uv, transcribe, etc.)
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ruff_cache/
+.pytest_cache/
+
+# logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# local env/secrets
+.env
+.env.*
+!.env.example
+
+# editor
+.idea/
+.vscode/
+*.swp
+*~
+
+# windows
+Thumbs.db
