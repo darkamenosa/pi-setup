@@ -22,6 +22,7 @@ const CONTINUATION_MARKER_CONTENT = "[pi-goal-continuation]";
 const AUTONOMOUS_YIELD_CHANNEL = "pi:autonomous-continuation-yield:v1";
 const AUTONOMOUS_QUERY_CHANNEL = "pi:autonomous-continuation-query:v1";
 const AUTOCOMPACT_BUFFERED_INPUT_CHANNEL = "pi:autocompact-buffered-input:v1";
+const AUTOCOMPACT_INTERRUPT_DIAGNOSTIC = "autocompact_proactive_interrupt";
 const MAX_OBJECTIVE_CHARS = 4_000;
 
 type GoalStatus = "active" | "paused" | "blocked" | "usageLimited" | "budgetLimited" | "complete";
@@ -452,16 +453,22 @@ function statusAfterObjectiveEdit(status: GoalStatus): GoalStatus {
 	}
 }
 
-function lastAssistantMessage(messages: Array<{ role?: string; stopReason?: string; errorMessage?: string }>) {
+function lastAssistantMessage(
+	messages: Array<{ role?: string; stopReason?: string; errorMessage?: string }>,
+): AssistantAccountingMessage | undefined {
 	for (let i = messages.length - 1; i >= 0; i--) {
 		const message = messages[i];
-		if (message?.role === "assistant") return message;
+		if (message?.role === "assistant") return message as AssistantAccountingMessage;
 	}
 	return undefined;
 }
 
 function wasLastAssistantAborted(messages: Array<{ role?: string; stopReason?: string }>): boolean {
 	return lastAssistantMessage(messages)?.stopReason === "aborted";
+}
+
+function wasAutocompactInterrupt(message: AssistantAccountingMessage | undefined): boolean {
+	return message?.diagnostics?.some((diagnostic) => diagnostic.type === AUTOCOMPACT_INTERRUPT_DIAGNOSTIC) === true;
 }
 
 function goalStopStatusForAssistantError(message: AssistantAccountingMessage | undefined): GoalStatus {
@@ -953,6 +960,10 @@ export default function goalExtension(pi: ExtensionAPI) {
 		if (goal.status !== "active") return;
 
 		const lastAssistant = lastAssistantMessage(event.messages);
+		if (wasAutocompactInterrupt(lastAssistant)) {
+			pendingAssistantErrorStop = null;
+			return;
+		}
 		if (lastAssistant?.stopReason === "error") {
 			const mayRecoverWithOverflowCompaction = isContextOverflow(
 				lastAssistant as Parameters<typeof isContextOverflow>[0],

@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
-import { mkdir, rm, stat, writeFile } from "node:fs/promises";
+import { realpathSync } from "node:fs";
+import { mkdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -15,32 +15,16 @@ import {
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
-// ---- Inlined Codex OAuth helpers (standalone extension; keep duplicated intentionally) ----
 const DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api";
-const DEFAULT_REFRESH_TOKEN_URL = "https://auth.openai.com/oauth/token";
-const CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
-const ACCESS_TOKEN_REFRESH_WINDOW_MS = 5 * 60 * 1000;
-const AUTH_LOCK_STALE_MS = 30_000;
-const AUTH_LOCK_MAX_ATTEMPTS = 30;
+const CODEX_PROVIDER_ID = "openai-codex";
 const FETCH_TIMEOUT_MS = 60_000;
-
 const CHATGPT_AUTH_CLAIM = "https://api.openai.com/auth";
 
-interface CodexOAuthCredential {
+interface PiCodexAuth {
 	accessToken: string;
-	refreshToken?: string;
-	accountId: string;
-	email?: string;
-	planType?: string;
-	expiresAt?: number;
-	isFedrampAccount: boolean;
-	authPath?: string;
-	source: "env" | "auth.json";
-}
-
-interface LoadedAuthJson {
-	path: string;
-	json: Record<string, unknown>;
+	baseUrl: string;
+	headers?: Record<string, string | null>;
+	source?: string;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -51,21 +35,54 @@ function readString(value: unknown): string | undefined {
 	return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
 }
 
-function sleep(ms: number, signal?: AbortSignal): Promise<void> {
-	if (ms <= 0) return Promise.resolve();
-	if (signal?.aborted) return Promise.reject(new Error("Operation aborted"));
-	return new Promise((resolve, reject) => {
-		const timeout = setTimeout(resolve, ms);
-		const onAbort = () => {
-			clearTimeout(timeout);
-			reject(new Error("Operation aborted"));
-		};
-		signal?.addEventListener("abort", onAbort, { once: true });
-	});
+function formatError(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
+}
+
+async function getPiCodexAuth(ctx: ExtensionContext): Promise<PiCodexAuth> {
+	let resolved;
+	try {
+		resolved = await ctx.modelRegistry.getProviderAuth(CODEX_PROVIDER_ID);
+	} catch (error) {
+		throw new Error(`Pi OpenAI Codex OAuth failed: ${formatError(error)}`);
+	}
+
+	const accessToken = readString(resolved?.auth.apiKey);
+	if (!accessToken) {
+		throw new Error("Pi OpenAI Codex OAuth is not configured. Run /login openai-codex, then retry.");
+	}
+
+	const source = readString(resolved?.source);
+	return {
+		accessToken,
+		baseUrl: readString(resolved?.auth.baseUrl) ?? DEFAULT_CODEX_BASE_URL,
+		...(resolved?.auth.headers ? { headers: resolved.auth.headers } : {}),
+		...(source ? { source } : {}),
+	};
+}
+
+function decodeJwtPayload(token: string): Record<string, unknown> {
+	const payload = token.split(".")[1];
+	if (!payload) return {};
+	try {
+		return JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as Record<string, unknown>;
+	} catch {
+		return {};
+	}
+}
+
+function accountIdFromAccessToken(accessToken: string): string {
+	const claim = decodeJwtPayload(accessToken)[CHATGPT_AUTH_CLAIM];
+	const accountId = isRecord(claim) ? readString(claim.chatgpt_account_id) : undefined;
+	if (!accountId) {
+		throw new Error("Pi OpenAI Codex OAuth access token does not contain a ChatGPT account id. Run /login openai-codex, then retry.");
+	}
+	return accountId;
 }
 
 function timeoutSignal(timeoutMs: number, parent?: AbortSignal): AbortSignal {
 	if (!parent) return AbortSignal.timeout(timeoutMs);
+	if (parent.aborted) return AbortSignal.abort(parent.reason);
 	const controller = new AbortController();
 	const timeout = setTimeout(() => controller.abort(new Error(`Timed out after ${timeoutMs}ms`)), timeoutMs);
 	const onAbort = () => controller.abort(parent.reason);
@@ -81,158 +98,6 @@ function timeoutSignal(timeoutMs: number, parent?: AbortSignal): AbortSignal {
 	return controller.signal;
 }
 
-function decodeJwtPayload(token: string | undefined): Record<string, unknown> {
-	if (!token) return {};
-	const payload = token.split(".")[1];
-	if (!payload) return {};
-	try {
-		return JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as Record<string, unknown>;
-	} catch {
-		return {};
-	}
-}
-
-function readAuthClaim(token: string | undefined): Record<string, unknown> {
-	const claim = decodeJwtPayload(token)[CHATGPT_AUTH_CLAIM];
-	return isRecord(claim) ? claim : {};
-}
-
-function expiresFromJwt(token: string | undefined): number | undefined {
-	const exp = decodeJwtPayload(token).exp;
-	if (typeof exp !== "number" || !Number.isFinite(exp) || exp <= 0) return undefined;
-	const ms = exp * 1000;
-	return Number.isSafeInteger(ms) ? ms : undefined;
-}
-
-function isAccessTokenFresh(accessToken: string | undefined, leewayMs = ACCESS_TOKEN_REFRESH_WINDOW_MS): boolean {
-	const expiresAt = expiresFromJwt(accessToken);
-	return expiresAt === undefined || expiresAt > Date.now() + leewayMs;
-}
-
-function codexHome(): string {
-	return readString(process.env.CODEX_HOME) ?? join(homedir(), ".codex");
-}
-
-function codexAuthPath(): string {
-	return readString(process.env.CODEX_AUTH_JSON) ?? join(codexHome(), "auth.json");
-}
-
-function loadAuthJson(path = codexAuthPath()): LoadedAuthJson | undefined {
-	if (!existsSync(path)) return undefined;
-	try {
-		const parsed = JSON.parse(readFileSync(path, "utf8"));
-		return isRecord(parsed) ? { path, json: parsed } : undefined;
-	} catch (error) {
-		throw new Error(`Failed to read Codex auth file ${path}: ${formatError(error)}`);
-	}
-}
-
-function getTokens(authJson: Record<string, unknown>): Record<string, unknown> | undefined {
-	return isRecord(authJson.tokens) ? authJson.tokens : undefined;
-}
-
-function tokenStringFromMaybeSerializedIdToken(value: unknown): string | undefined {
-	if (typeof value === "string") return readString(value);
-	if (isRecord(value)) return readString(value.raw_jwt);
-	return undefined;
-}
-
-function credentialFromAuthJson(loaded: LoadedAuthJson): CodexOAuthCredential | undefined {
-	const tokens = getTokens(loaded.json);
-	if (!tokens) return undefined;
-	const accessToken = readString(tokens.access_token);
-	const refreshToken = readString(tokens.refresh_token);
-	if (!accessToken) return undefined;
-	const idToken = tokenStringFromMaybeSerializedIdToken(tokens.id_token);
-	const accessClaim = readAuthClaim(accessToken);
-	const idClaim = readAuthClaim(idToken);
-	const accountId =
-		readString(tokens.account_id) ??
-		readString(accessClaim.chatgpt_account_id) ??
-		readString(idClaim.chatgpt_account_id);
-	if (!accountId) {
-		throw new Error("Codex OAuth access token does not contain a ChatGPT account id. Re-run `codex login`.");
-	}
-	return {
-		accessToken,
-		...(refreshToken ? { refreshToken } : {}),
-		accountId,
-		...(readString(idClaim.email) ?? readString(decodeJwtPayload(idToken).email) ? { email: readString(idClaim.email) ?? readString(decodeJwtPayload(idToken).email) } : {}),
-		...(readString(idClaim.chatgpt_plan_type) ? { planType: readString(idClaim.chatgpt_plan_type) } : {}),
-		expiresAt: expiresFromJwt(accessToken),
-		isFedrampAccount: idClaim.chatgpt_account_is_fedramp === true || accessClaim.chatgpt_account_is_fedramp === true,
-		authPath: loaded.path,
-		source: "auth.json",
-	};
-}
-
-function credentialFromEnv(): CodexOAuthCredential | undefined {
-	const accessToken = readString(process.env.CODEX_ACCESS_TOKEN);
-	if (!accessToken) return undefined;
-	const claim = readAuthClaim(accessToken);
-	const accountId = readString(claim.chatgpt_account_id);
-	if (!accountId) {
-		throw new Error("CODEX_ACCESS_TOKEN is set, but it does not contain a ChatGPT account id claim.");
-	}
-	return {
-		accessToken,
-		accountId,
-		expiresAt: expiresFromJwt(accessToken),
-		isFedrampAccount: claim.chatgpt_account_is_fedramp === true,
-		source: "env",
-	};
-}
-
-function isProcessAlive(pid: number): boolean {
-	try {
-		process.kill(pid, 0);
-		return true;
-	} catch (error) {
-		return isRecord(error) && error.code === "EPERM";
-	}
-}
-
-function lockHasLiveOwner(lockPath: string): boolean {
-	try {
-		const [pidText] = readFileSync(lockPath, "utf8").split(":", 1);
-		const pid = Number(pidText);
-		return Number.isSafeInteger(pid) && pid > 0 && isProcessAlive(pid);
-	} catch {
-		return false;
-	}
-}
-
-async function withAuthLock<T>(authPath: string, fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
-	const lockPath = `${authPath}.lock`;
-	await mkdir(dirname(authPath), { recursive: true });
-	let acquired = false;
-	for (let attempt = 0; attempt < AUTH_LOCK_MAX_ATTEMPTS; attempt++) {
-		if (signal?.aborted) throw new Error("Operation aborted");
-		try {
-			writeFileSync(lockPath, `${process.pid}:${Date.now()}`, { encoding: "utf8", flag: "wx", mode: 0o600 });
-			acquired = true;
-			break;
-		} catch (error) {
-			if (!isRecord(error) || error.code !== "EEXIST") throw error;
-			try {
-				const lockStat = await stat(lockPath);
-				if (Date.now() - lockStat.mtimeMs > AUTH_LOCK_STALE_MS && !lockHasLiveOwner(lockPath)) {
-					await rm(lockPath, { force: true });
-				}
-			} catch {
-				// Lock disappeared or could not be inspected; retry.
-			}
-			await sleep(100 * (attempt + 1), signal);
-		}
-	}
-	if (!acquired) throw new Error(`Timed out waiting for Codex auth lock ${lockPath}`);
-	try {
-		return await fn();
-	} finally {
-		await rm(lockPath, { force: true }).catch(() => undefined);
-	}
-}
-
 async function readJsonOrText(response: Response): Promise<{ json: unknown; text: string }> {
 	const text = await response.text();
 	let json: unknown;
@@ -244,10 +109,6 @@ async function readJsonOrText(response: Response): Promise<{ json: unknown; text
 	return { json, text };
 }
 
-function formatError(error: unknown): string {
-	return error instanceof Error ? error.message : String(error);
-}
-
 function formatHttpFailure(context: string, response: Response, body: { json: unknown; text: string }): string {
 	const record = isRecord(body.json) ? body.json : {};
 	const nestedError = isRecord(record.error) ? record.error : undefined;
@@ -256,129 +117,39 @@ function formatHttpFailure(context: string, response: Response, body: { json: un
 	return `${context} failed (${response.status}${response.statusText ? ` ${response.statusText}` : ""})${code ? ` [${code}]` : ""}${message ? `: ${message}` : ""}`;
 }
 
-interface RefreshResponse {
-	id_token?: unknown;
-	access_token?: unknown;
-	refresh_token?: unknown;
-}
-
-async function requestTokenRefresh(refreshToken: string, signal?: AbortSignal): Promise<RefreshResponse> {
-	const response = await fetch(readString(process.env.CODEX_REFRESH_TOKEN_URL_OVERRIDE) ?? DEFAULT_REFRESH_TOKEN_URL, {
-		method: "POST",
-		headers: { "Content-Type": "application/json", Accept: "application/json" },
-		body: JSON.stringify({
-			client_id: CODEX_OAUTH_CLIENT_ID,
-			grant_type: "refresh_token",
-			refresh_token: refreshToken,
-		}),
-		signal: timeoutSignal(FETCH_TIMEOUT_MS, signal),
-	});
-	const body = await readJsonOrText(response);
-	if (!response.ok) throw new Error(formatHttpFailure("Codex OAuth token refresh", response, body));
-	return (isRecord(body.json) ? body.json : {}) as RefreshResponse;
-}
-
-function saveRefreshedAuth(loaded: LoadedAuthJson, refresh: RefreshResponse): LoadedAuthJson {
-	const tokens = getTokens(loaded.json);
-	if (!tokens) throw new Error("Codex auth file is missing tokens");
-	const idToken = readString(refresh.id_token);
-	const accessToken = readString(refresh.access_token);
-	const refreshToken = readString(refresh.refresh_token);
-	if (idToken) tokens.id_token = idToken;
-	if (accessToken) tokens.access_token = accessToken;
-	if (refreshToken) tokens.refresh_token = refreshToken;
-	loaded.json.last_refresh = new Date().toISOString();
-	writeFileSync(loaded.path, `${JSON.stringify(loaded.json, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
-	return loadAuthJson(loaded.path) ?? loaded;
-}
-
-async function refreshAuthJsonCredential(loaded: LoadedAuthJson, signal?: AbortSignal): Promise<CodexOAuthCredential> {
-	const before = credentialFromAuthJson(loaded);
-	if (!before?.refreshToken) throw new Error("Codex auth file has no refresh token. Re-run `codex login`.");
-	const refresh = await requestTokenRefresh(before.refreshToken, signal);
-	const nextLoaded = saveRefreshedAuth(loaded, refresh);
-	const credential = credentialFromAuthJson(nextLoaded);
-	if (!credential) throw new Error("Codex token refresh succeeded, but refreshed auth could not be loaded.");
-	return credential;
-}
-
-async function loadCodexOAuthCredential(options: { allowRefresh?: boolean; signal?: AbortSignal } = {}): Promise<CodexOAuthCredential> {
-	const envCredential = credentialFromEnv();
-	if (envCredential) {
-		if (!isAccessTokenFresh(envCredential.accessToken)) {
-			throw new Error("CODEX_ACCESS_TOKEN is expired or expiring soon. Refresh it with `codex login` or unset CODEX_ACCESS_TOKEN to use ~/.codex/auth.json.");
-		}
-		return envCredential;
-	}
-
-	const authPath = codexAuthPath();
-	const loaded = loadAuthJson(authPath);
-	if (!loaded) {
-		throw new Error(`No local Codex OAuth credentials found at ${authPath}. Run \`codex login\` first.`);
-	}
-
-	const credential = credentialFromAuthJson(loaded);
-	if (!credential) {
-		throw new Error(`Codex auth file ${authPath} does not contain ChatGPT OAuth tokens. Run \`codex login\`.`);
-	}
-	if (!options.allowRefresh || isAccessTokenFresh(credential.accessToken)) return credential;
-
-	return withAuthLock(authPath, async () => {
-		const reloaded = loadAuthJson(authPath);
-		if (!reloaded) throw new Error(`Codex auth file disappeared: ${authPath}`);
-		const current = credentialFromAuthJson(reloaded);
-		if (!current) throw new Error(`Codex auth file ${authPath} does not contain ChatGPT OAuth tokens.`);
-		if (isAccessTokenFresh(current.accessToken)) return current;
-		return refreshAuthJsonCredential(reloaded, options.signal);
-	}, options.signal);
-}
-
-function hasUsableCodexOAuthCredential(): boolean {
-	try {
-		const envCredential = credentialFromEnv();
-		if (envCredential) return isAccessTokenFresh(envCredential.accessToken);
-		const loaded = loadAuthJson();
-		if (!loaded) return false;
-		const credential = credentialFromAuthJson(loaded);
-		return !!credential && (isAccessTokenFresh(credential.accessToken) || !!credential.refreshToken);
-	} catch {
-		return false;
-	}
-}
-
-function codexBackendBaseUrl(): string {
-	return readString(process.env.CODEX_BACKEND_BASE_URL) ?? DEFAULT_CODEX_BASE_URL;
-}
-
-function codexBackendUrl(path: string, baseUrl = codexBackendBaseUrl()): string {
+function codexBackendUrl(path: string, baseUrl: string): string {
 	const normalizedBase = baseUrl.replace(/\/+$/, "");
 	const normalizedPath = path.replace(/^\/+/, "");
 	if (normalizedBase.endsWith("/codex")) return `${normalizedBase}/${normalizedPath}`;
 	return `${normalizedBase}/codex/${normalizedPath}`;
 }
 
-function buildCodexHeaders(credential: CodexOAuthCredential, extraHeaders: Record<string, string> = {}): Headers {
-	const headers = new Headers(extraHeaders);
-	headers.set("Authorization", `Bearer ${credential.accessToken}`);
-	headers.set("ChatGPT-Account-ID", credential.accountId);
-	headers.set("originator", "pi-codex-extension");
-	headers.set("User-Agent", `pi-codex-extension (${process.platform}; ${process.arch})`);
-	if (credential.isFedrampAccount) headers.set("X-OpenAI-Fedramp", "true");
+function buildCodexHeaders(auth: PiCodexAuth, accountId: string, extraHeaders: Record<string, string> = {}): Headers {
+	const headers = new Headers();
+	for (const [name, value] of Object.entries(auth.headers ?? {})) {
+		if (value !== null) headers.set(name, value);
+	}
+	for (const [name, value] of Object.entries(extraHeaders)) headers.set(name, value);
+	headers.set("Authorization", `Bearer ${auth.accessToken}`);
+	headers.set("ChatGPT-Account-ID", accountId);
+	headers.set("originator", "pi");
+	headers.set("User-Agent", `pi-codex-search (${process.platform}; ${process.arch})`);
 	return headers;
 }
 
 async function codexJsonRequest<T = unknown>(
 	path: string,
 	body: unknown,
+	ctx: ExtensionContext,
 	options: { signal?: AbortSignal; headers?: Record<string, string> } = {},
 ): Promise<T> {
-	const credential = await loadCodexOAuthCredential({ allowRefresh: true, signal: options.signal });
-	const headers = buildCodexHeaders(credential, {
+	const auth = await getPiCodexAuth(ctx);
+	const headers = buildCodexHeaders(auth, accountIdFromAccessToken(auth.accessToken), {
 		Accept: "application/json",
 		"Content-Type": "application/json",
 		...(options.headers ?? {}),
 	});
-	const response = await fetch(codexBackendUrl(path), {
+	const response = await fetch(codexBackendUrl(path, auth.baseUrl), {
 		method: "POST",
 		headers,
 		body: JSON.stringify(body),
@@ -389,20 +160,6 @@ async function codexJsonRequest<T = unknown>(
 	if (responseBody.json === undefined) throw new Error(`Codex ${path} returned non-JSON response: ${responseBody.text.slice(0, 800)}`);
 	return responseBody.json as T;
 }
-
-function describeCredential(credential: CodexOAuthCredential): string {
-	const bits = [
-		`source=${credential.source}`,
-		`account=${credential.accountId}`,
-		credential.email ? `email=${credential.email}` : undefined,
-		credential.planType ? `plan=${credential.planType}` : undefined,
-		credential.expiresAt ? `expires=${new Date(credential.expiresAt).toLocaleString()}` : undefined,
-		credential.authPath ? `authPath=${credential.authPath}` : undefined,
-	];
-	return bits.filter((bit): bit is string => !!bit).join(", ");
-}
-// ---- End inlined Codex OAuth helpers ----
-
 
 const TOOL_NAME = "codex_search";
 const SUBAGENT_CAPABILITY_REQUEST_CHANNEL = "pi-subagent:capability-request:v1";
@@ -561,9 +318,9 @@ async function truncateToolText(text: string): Promise<{ text: string; details: 
 	return { text: truncation.content + notice, details: { truncation, fullOutputPath: outputPath } };
 }
 
-async function runSearch(params: CodexSearchParams, signal?: AbortSignal): Promise<{ output: string; details: Record<string, unknown> }> {
+async function runSearch(params: CodexSearchParams, ctx: ExtensionContext, signal?: AbortSignal): Promise<{ output: string; details: Record<string, unknown> }> {
 	const request = buildSearchRequest(params);
-	const response = await codexJsonRequest<CodexSearchResponse>("alpha/search", request, { signal });
+	const response = await codexJsonRequest<CodexSearchResponse>("alpha/search", request, ctx, { signal });
 	if (typeof response.output !== "string") throw new Error("Codex search response is missing string output.");
 	return {
 		output: response.output,
@@ -601,13 +358,14 @@ const CodexSearchParamsSchema = Type.Object({
 });
 
 export const __codexSearchTest = {
+	accountIdFromAccessToken,
+	buildCodexHeaders,
 	createSearchToolSync,
+	getPiCodexAuth,
 	modelSupportsNativeWebSearch,
 };
 
 export default function (pi: ExtensionAPI) {
-	if (!hasUsableCodexOAuthCredential()) return;
-
 	const childMode = process.env.PI_SUBAGENT_CHILD === "1";
 	if (!childMode) registerSubagentToolCapability(pi);
 	const syncSearchToolForModel = createSearchToolSync(pi);
@@ -617,8 +375,8 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: TOOL_NAME,
 		label: "Codex Search",
-		description: `Search the web through OpenAI Codex local OAuth credentials. Output is truncated to ${DEFAULT_MAX_LINES} lines or ${formatSize(DEFAULT_MAX_BYTES)}.`,
-		promptSnippet: "Run live web research through Codex OAuth and return cited/current results.",
+		description: `Search the web through Pi's OpenAI Codex OAuth. Output is truncated to ${DEFAULT_MAX_LINES} lines or ${formatSize(DEFAULT_MAX_BYTES)}.`,
+		promptSnippet: "Run live web research through Pi's OpenAI Codex OAuth and return cited/current results.",
 		promptGuidelines: [
 			`Use ${TOOL_NAME} by default for live/current web research instead of Ollama web search or unavailable native web_search tools.`,
 			`Use ${TOOL_NAME} when a local/text-only model such as ollama/glm-5.2:cloud needs current information from the web.`,
@@ -627,9 +385,9 @@ export default function (pi: ExtensionAPI) {
 			`After ${TOOL_NAME} returns, cite or summarize the source URLs present in its output when answering the user.`,
 		],
 		parameters: CodexSearchParamsSchema,
-		async execute(_toolCallId, params, signal, onUpdate) {
+		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			onUpdate?.({ content: [{ type: "text", text: "Searching with Codex..." }] });
-			const result = await runSearch(params as CodexSearchParams, signal);
+			const result = await runSearch(params as CodexSearchParams, ctx, signal);
 			const truncated = await truncateToolText(result.output);
 			return {
 				content: [{ type: "text", text: truncated.text }],
@@ -656,16 +414,16 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	if (!childMode) pi.registerCommand("codex-search", {
-		description: "Show Codex search OAuth status",
+		description: "Check Pi OpenAI Codex OAuth for Codex search",
 		handler: async (_args, ctx) => {
 			try {
-				const credential = await loadCodexOAuthCredential({ allowRefresh: false, signal: ctx.signal });
+				const auth = await getPiCodexAuth(ctx);
 				ctx.ui.notify(
-					[`Codex search: ${describeCredential(credential)}`, `Default model: ${DEFAULT_SEARCH_MODEL}`, `Output dir: ${OUTPUT_DIR}`].join("\n"),
+					[`Codex search: ${auth.source ?? "Pi OpenAI Codex OAuth"} ready`, `Default model: ${DEFAULT_SEARCH_MODEL}`, `Output dir: ${OUTPUT_DIR}`].join("\n"),
 					"info",
 				);
 			} catch (error) {
-				ctx.ui.notify(`Codex search auth error: ${error instanceof Error ? error.message : String(error)}`, "error");
+				ctx.ui.notify(`Codex search auth error: ${formatError(error)}`, "error");
 			}
 		},
 	});

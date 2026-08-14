@@ -515,10 +515,6 @@ interface WorkflowEvidenceInput {
 	fingerprint?: string;
 }
 
-interface WorkflowDecision {
-	summary: string;
-}
-
 interface WorkflowReviewFinding {
 	requirement_id: string;
 	status: WorkflowReviewStatus;
@@ -699,7 +695,7 @@ interface WorkflowWaveRun {
 }
 
 type WorkflowActivityTransition =
-	| { type: "prepare_step"; decision?: WorkflowDecision; attemptId: string; toolCallId: string; agents: Array<{ description: string; type: string; access?: AgentAccess; context?: AgentContext; memory?: MemoryMode; tools?: string[]; schema?: unknown }>; at: number }
+	| { type: "prepare_step"; decision?: string; attemptId: string; toolCallId: string; agents: Array<{ description: string; type: string; access?: AgentAccess; context?: AgentContext; memory?: MemoryMode; tools?: string[]; schema?: unknown }>; at: number }
 	| { type: "start_step"; stepId: string; at: number }
 	| { type: "update_step"; stepId: string; attemptId: string; agents: WorkflowAgentActivity[]; at: number }
 	| { type: "settle_step"; stepId: string; attemptId: string; status: "completed" | "failed"; agents: WorkflowAgentActivity[]; reviewEvidence?: WorkflowEvidenceInput[]; outputFile?: string; failureCode?: string; failure?: string; at: number }
@@ -772,7 +768,15 @@ function formatTokens(count: number): string {
 }
 
 function formatDuration(ms: number): string {
-	return ms < 10000 ? `${(ms / 1000).toFixed(1)}s` : `${Math.round(ms / 1000)}s`;
+	if (ms < 10000) return `${(ms / 1000).toFixed(1)}s`;
+	const seconds = Math.round(ms / 1000);
+	if (seconds < 60) return `${seconds}s`;
+	const minutes = Math.floor(seconds / 60);
+	const remainingSeconds = seconds % 60;
+	if (minutes < 60) return remainingSeconds ? `${minutes}m ${remainingSeconds}s` : `${minutes}m`;
+	const hours = Math.floor(minutes / 60);
+	const remainingMinutes = minutes % 60;
+	return remainingMinutes ? `${hours}h ${remainingMinutes}m` : `${hours}h`;
 }
 
 function displayModel(model: string): string {
@@ -1308,8 +1312,8 @@ function workflowNotebookDecisionSummary(activity: WorkflowActivity, notebook: W
 	return rendered;
 }
 
-function applyWorkflowDecision(activity: WorkflowActivity, decision: WorkflowDecision): void {
-	const summary = validateWorkflowDecisionText(decision.summary, "workflow_decision_missing", "Workflow decision summary");
+function applyWorkflowDecision(activity: WorkflowActivity, decision: string): void {
+	const summary = validateWorkflowDecisionText(decision, "workflow_decision_missing", "Workflow decision summary");
 	const sourceStep = workflowLatestSettledStep(activity);
 	if (!sourceStep) workflowFailure("workflow_decision_source_missing", "Workflow continuation has no settled Step to review");
 	const sourceAttempt = workflowCurrentAttempt(sourceStep);
@@ -1642,11 +1646,12 @@ function workflowActivityTreeLines(snapshot: WorkflowActivitySnapshot, width: nu
 				const agentIcon = agent.status === "running" ? spinner : agent.status === "error" ? "✗" : agent.status === "stopped" ? "■" : agent.status === "completed" ? "✓" : "○";
 				const metadata = [
 					agentStatusText(agent.status),
+					agent.status === "running" || agent.status === "queued" ? `${formatDuration(Date.now() - attempt.startedAt)} elapsed` : undefined,
+					`${agent.toolUses} tool calls`,
+					agent.childStarts && agent.childStarts > 1 ? `${agent.childStarts} child starts` : undefined,
 					agent.model,
 					agent.thinking ? `${agent.thinking} thinking` : undefined,
 					agent.context ? `${agent.context} context` : undefined,
-					`${agent.toolUses} tool calls`,
-					agent.childStarts && agent.childStarts > 1 ? `${agent.childStarts} child starts` : undefined,
 					`${formatTokens(agent.tokens)} tokens`,
 				].filter(Boolean).join(" · ");
 				const agentPriority = agent.status === "error" || agent.status === "stopped" ? 2 : agent.status === "running" ? 2.1 : agent.status === "queued" ? 2.2 : 2.3;
@@ -3544,9 +3549,7 @@ const WorkflowStepSchema = Type.Object({
 	on_pass: Type.Optional(Type.String({ minLength: 1, description: "Review Step target when every scoped requirement passes" })),
 	on_fail: Type.Optional(Type.String({ minLength: 1, description: "Review target when any scoped requirement fails; optional for final-review when failure should stop for a parent blocked or needs_input decision" })),
 });
-const WorkflowDecisionSchema = Type.Object({
-	summary: Type.String({ minLength: 1, description: "Concise parent synthesis of the Step just reviewed. For fail or retry routes, make it a recovery brief covering what not to repeat, the user outcome, constraints and patterns to preserve, creative freedom, the material next change, and proof. The runtime already owns the declared transition." }),
-});
+const WorkflowDecisionSchema = Type.String({ minLength: 1, description: "Concise parent synthesis of the Step just reviewed. For fail or retry routes, make it a recovery brief covering what not to repeat, the user outcome, constraints and patterns to preserve, creative freedom, the material next change, and proof. The runtime already owns the declared transition." });
 const StartWorkflowParams = Type.Object({
 	title: Type.String({ minLength: 1, description: "Short Workflow title shown in the activity tree" }),
 	objective: Type.String({ minLength: 1, description: "Immutable user objective; only a new user-authorized Workflow may change it" }),
@@ -4402,13 +4405,13 @@ export default function subagent(pi: ExtensionAPI): void {
 				}
 				if (terminalReceived) throw new SubagentFailure("subagent_progress_malformed", `Unexpected ${event.type} after terminal`);
 				if (event.type !== "reasoning") markFirstAction();
-				if (event.type === "heartbeat") {
-					if (record.activeTools.size === 0) record.activity = "Reasoning about the task…";
-				} else if (event.type === "reasoning") {
+				if (event.type === "heartbeat" || event.type === "reasoning") {
 					if (record.activeTools.size === 0) {
-						record.activity = record.lastToolActivity
-							? `Last action: ${record.lastToolActivity}`
-							: firstActionObserved ? "Reasoning about the task…" : "Pi ready; waiting for first model action…";
+						record.activity = !firstActionObserved
+							? "Pi ready; waiting for first model action…"
+							: record.lastToolActivity
+								? `Reasoning… · Last action: ${record.lastToolActivity}`
+								: "Reasoning about the task…";
 					}
 				} else if (event.type === "continuation") {
 					record.activity = "Continuing after output-token limit…";
@@ -5163,7 +5166,7 @@ export default function subagent(pi: ExtensionAPI): void {
 		description: "Run one foreground wave for the runtime-selected Step in the declared graph. The first Step has no decision; each continuation records the parent's synthesis. Review results choose pass/fail routes automatically.",
 		promptSnippet: "Run the runtime-selected deterministic Workflow Step",
 		promptGuidelines: [
-			"Use run_workflow_step only for an active explicitly requested Workflow. The first Step omits decision; every later Step or retry includes the parent's concise synthesis after inspecting prior reports. The synthesis is injected as untrusted predecessor orientation and recorded in the Workflow Guide; raw reports are not forwarded or persisted there. The runtime selects the Step, so callers do not supply step_id.",
+			"Use run_workflow_step only for an active explicitly requested Workflow. The first Step omits decision; every later Step or retry passes decision as the parent's concise plain string after inspecting prior reports. The synthesis is injected as untrusted predecessor orientation and recorded in the Workflow Guide; raw reports are not forwarded or persisted there. The runtime selects the Step, so callers do not supply step_id.",
 			"For pass or next routes, briefly record what changed or was verified and the useful evidence. For fail or retry routes, record what was tried, why it failed, what should not be repeated, and the next approach; include user outcome and constraints when they matter. Summarize relevant context directly rather than pointing children at old transcripts.",
 			"run_workflow_step accepts only current-Step agents and must be the only delegated call in its tool batch. Work and review Steps need at least one agent; final-review needs at least two independent evaluators. Review roles are flexible; the runtime forces fresh read-only execution and final-review memory off.",
 			"Give every selected agent a current-Step task small enough to understand, complete, and verify coherently. Multiple agents do not repair an oversized Step; parallelize only disjoint ownership. If the immutable current Step cannot be delegated and reviewed this way, or its requirements need later work before they can pass, do not improvise new scope: finish blocked or needs_input and require a newly authorized Workflow.",

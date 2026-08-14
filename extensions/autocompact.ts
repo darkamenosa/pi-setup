@@ -35,6 +35,7 @@ const CONTINUATION_MARKER_CONTENT = "[pi-incomplete-turn-continuation]";
 const PROACTIVE_CONTINUATION_MARKER_CONTENT = "[pi-proactive-compaction-continuation]";
 const BUFFERED_INPUT_MESSAGE_TYPE = "autocompact-buffered-input";
 const BUFFERED_INPUT_EVENT_CHANNEL = "pi:autocompact-buffered-input:v1";
+const PROACTIVE_INTERRUPT_DIAGNOSTIC = "autocompact_proactive_interrupt";
 const NATIVE_DETAILS_KEY = "openaiNativeCompaction";
 const NATIVE_BOUNDARY_MESSAGE_TYPE = "autocompact-native-boundary";
 const NATIVE_BOUNDARY_PREFIX = "pi-native-compaction-boundary";
@@ -56,7 +57,16 @@ const TRANSIENT_GOAL_CONTEXT_TYPES = new Set(["goal-ui", "goal-context", "goal-b
 
 interface AssistantMessage {
 	role?: string;
+	content?: Array<Record<string, unknown>>;
 	stopReason?: string;
+	timestamp?: number;
+	usage?: Partial<Usage>;
+	diagnostics?: Array<{
+		type: string;
+		timestamp: number;
+		error?: { name?: string; message: string; stack?: string; code?: string | number };
+		details?: Record<string, unknown>;
+	}>;
 }
 
 interface ContinuationDetails {
@@ -71,6 +81,7 @@ interface ProactiveCompactionAttempt {
 	inputGeneration: number;
 	sessionId: string;
 	committed: boolean;
+	interruptionObserved: boolean;
 	goalOwnedRun: boolean;
 }
 
@@ -169,6 +180,48 @@ function lastAssistantMessage(messages: AssistantMessage[]): AssistantMessage | 
 		if (messages[index]?.role === "assistant") return messages[index];
 	}
 	return undefined;
+}
+
+function isEmptyAssistantContent(content: AssistantMessage["content"]): boolean {
+	if (!Array.isArray(content)) return false;
+	return content.every((part) => part.type === "text" && (typeof part.text !== "string" || part.text.length === 0));
+}
+
+function hasZeroUsage(usage: AssistantMessage["usage"]): boolean {
+	return usage?.input === 0
+		&& usage.output === 0
+		&& usage.cacheRead === 0
+		&& usage.cacheWrite === 0
+		&& usage.totalTokens === 0;
+}
+
+function markProactiveInterrupt<T extends AssistantMessage>(
+	message: T,
+	signalAborted: boolean,
+	attemptId: string,
+): T | undefined {
+	if (
+		message.role !== "assistant"
+		|| (message.stopReason !== "error" && message.stopReason !== "aborted")
+		|| !signalAborted
+		|| !isEmptyAssistantContent(message.content)
+		|| !hasZeroUsage(message.usage)
+	) return;
+	if (message.diagnostics?.some((diagnostic) => diagnostic.type === PROACTIVE_INTERRUPT_DIAGNOSTIC)) {
+		return message.stopReason === "aborted" ? message : { ...message, stopReason: "aborted" };
+	}
+	return {
+		...message,
+		stopReason: "aborted",
+		diagnostics: [
+			...(message.diagnostics ?? []),
+			{
+				type: PROACTIVE_INTERRUPT_DIAGNOSTIC,
+				timestamp: message.timestamp ?? Date.now(),
+				details: { attemptId },
+			},
+		],
+	};
 }
 
 function goalStatuses(ctx: ExtensionContext): Array<string | null> {
@@ -1242,6 +1295,7 @@ export const __autocompactTest = {
 	shouldCompactBeforeNextTurn,
 	retryableEventCode,
 	supportsNativeCompaction,
+	markProactiveInterrupt,
 	trimTrailingToolOutputs,
 	truncateRetainedUsers,
 	usageFromResponse,
@@ -1458,6 +1512,7 @@ export default function autocompact(pi: ExtensionAPI) {
 			inputGeneration,
 			sessionId: ctx.sessionManager.getSessionId(),
 			committed: false,
+			interruptionObserved: false,
 			goalOwnedRun: goalOwnsCurrentRun(statuses, runStartedWithActiveGoal, goalEntryCountAtRunStart),
 		};
 		proactiveAttempt = attempt;
@@ -1562,11 +1617,21 @@ export default function autocompact(pi: ExtensionAPI) {
 	});
 
 	pi.on("message_end", async (event, ctx) => {
-		const message = event.message as {
-			role?: string;
+		const message = event.message as AssistantMessage & {
 			customType?: string;
 			details?: Partial<BufferedInputDetails>;
 		};
+		if (
+			proactiveAttempt
+			&& !proactiveAttempt.interruptionObserved
+			&& ctx.sessionManager.getSessionId() === proactiveAttempt.sessionId
+		) {
+			const interrupted = markProactiveInterrupt(message, ctx.signal?.aborted === true, proactiveAttempt.id);
+			if (interrupted) {
+				proactiveAttempt.interruptionObserved = true;
+				return { message: interrupted as typeof event.message };
+			}
+		}
 		if (
 			!inputInHandoff
 			|| message.role !== "custom"
@@ -1599,7 +1664,14 @@ export default function autocompact(pi: ExtensionAPI) {
 	pi.on("turn_start", async (event, ctx) => {
 		handOffNextBufferedInput(ctx);
 		if (event.turnIndex === 0 || ctx.mode === "print" || ctx.mode === "json") return;
-		if (proactiveAttempt || inputInHandoff || bufferedInputs.length > 0 || proactiveRetrySuppressed || ctx.hasPendingMessages()) return;
+		if (
+			ctx.signal?.aborted === true
+			|| proactiveAttempt
+			|| inputInHandoff
+			|| bufferedInputs.length > 0
+			|| proactiveRetrySuppressed
+			|| ctx.hasPendingMessages()
+		) return;
 		if (!shouldCompactBeforeNextTurn(ctx.getContextUsage(), compactionSettings)) return;
 		startProactiveCompaction(ctx);
 	});
