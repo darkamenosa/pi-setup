@@ -31,7 +31,7 @@ import { Type, type Static } from "typebox";
 
 const CHILD_ENV = "PI_SUBAGENT_CHILD";
 const CHILD_SPEC_ENV = "PI_SUBAGENT_SPEC";
-const CHILD_PROTOCOL_VERSION = 6;
+const CHILD_PROTOCOL_VERSION = 7;
 const CHILD_PROGRESS_FD = 3;
 const CHILD_WATCHDOG_FD = 4;
 const MEMORY_CHILD_READ_ONLY_ENV = "PI_MEMORY_SUBAGENT_READ_ONLY";
@@ -45,6 +45,9 @@ const FAST_SERVICE_TIER = "priority";
 const FAST_SUPPORTED_APIS = new Set(["openai-responses", "openai-codex-responses"]);
 const FAST_SUPPORTED_PROVIDERS = new Set(["openai", "openai-codex"]);
 const CAPABILITY_VERSION = 1;
+const MEMORY_AUTHORIZATION_VERSION = 1;
+const SESSION_HEADER_MAX_BYTES = 1024 * 1024;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const STRUCTURED_OUTPUT_TOOL = "StructuredOutput";
 const STRUCTURED_OUTPUT_FILE = "structured-output.json";
 const STRUCTURED_OUTPUT_MAX_BYTES = 100_000;
@@ -256,17 +259,63 @@ type AgentContext = "fresh" | "parent";
 type AgentStatus = "queued" | "running" | "completed" | "error" | "stopped";
 type MemoryMode = "off" | "read";
 
+type MemoryScope = "global" | "active-space";
+type ParentMemoryAssignment = "global" | "space" | "disabled" | "unavailable";
+
+interface ParentSessionIdentity {
+	path: string;
+	id: string;
+}
+
+interface ActiveSpaceReadGrant {
+	parentSessionKey: string;
+	parentSessionId: string;
+	parentSessionPath: string;
+	scopeKey: string;
+	spaceId: string;
+	membershipGeneration: number;
+	spaceGeneration: number;
+	scopeGeneration: number;
+	readGlobal: boolean;
+}
+
+interface CapturedMemoryBootstrap {
+	mode: MemoryScope;
+	grant?: ActiveSpaceReadGrant;
+}
+
+interface ChildMemoryBootstrap extends CapturedMemoryBootstrap {
+	version: 1;
+	bootstrapId: string;
+}
+
+interface MemoryAuthorizationRequest {
+	version: 1;
+	parentSessionPath: string;
+	parentSessionId: string;
+}
+
+interface MemoryAuthorizationResponse {
+	version: 1;
+	parentAssignment: ParentMemoryAssignment;
+	activeSpaceReadGrant?: ActiveSpaceReadGrant;
+}
+
 interface MemoryReadCapability {
 	version: number;
 	extensionPath: string;
+	memoryBootstrap: CapturedMemoryBootstrap;
 }
 
-interface ExtensionCapability extends MemoryReadCapability {
+interface ExtensionCapability {
+	version: number;
+	extensionPath: string;
 	requestId: string;
 	kind: "memory-read" | "provider" | "read-only-tools" | "fast-mode";
 	provider?: string;
 	tools?: string[];
 	fastMode?: "priority" | "off";
+	memoryAuthorization?: MemoryAuthorizationResponse;
 }
 
 interface ReadOnlyToolExtension {
@@ -279,6 +328,8 @@ interface ChildIntegrationStatus {
 	requestId: string;
 	kind: "memory-read";
 	status: "ready" | "unavailable";
+	memoryScope?: MemoryScope;
+	memoryBootstrapId?: string;
 	message?: string;
 }
 
@@ -311,6 +362,7 @@ interface ChildSpec {
 	workspaceRoot: string;
 	memoryRequested: boolean;
 	memoryRequired: boolean;
+	memoryBootstrap?: ChildMemoryBootstrap;
 	requiredToolOwners?: Record<string, string>;
 	outputSchema?: JsonSchema;
 	outputSchemaHash?: string;
@@ -341,7 +393,7 @@ interface ChildTurnUsage {
 type TerminalOutcome = "prose" | "structured" | "structured_missing" | "output_incomplete";
 
 type ChildProgressEvent =
-	| { type: "hello"; version: number; model: string; api: string; thinking: ModelThinkingLevel; fastMode: "priority" | "off"; memory: MemoryMode; watchdog: "active"; writerLease: "active" | "off"; schemaHash?: string }
+	| { type: "hello"; version: number; model: string; api: string; thinking: ModelThinkingLevel; fastMode: "priority" | "off"; memory: MemoryMode; memoryScope?: MemoryScope; memoryBootstrapId?: string; watchdog: "active"; writerLease: "active" | "off"; schemaHash?: string }
 	| { type: "reject"; version: number; errorCode: string; message: string }
 	| { type: "heartbeat" }
 	| { type: "reasoning" }
@@ -2097,6 +2149,101 @@ function recordSnapshot(record: SubagentRecord): RecordSnapshot {
 	};
 }
 
+function hasOnlyKeys(value: Record<string, unknown>, allowed: readonly string[]): boolean {
+	const keys = new Set(allowed);
+	return Object.keys(value).every((key) => keys.has(key));
+}
+
+function activeSpaceReadGrant(value: unknown): ActiveSpaceReadGrant | undefined {
+	if (!plainObject(value) || !hasOnlyKeys(value, [
+		"parentSessionKey",
+		"parentSessionId",
+		"parentSessionPath",
+		"scopeKey",
+		"spaceId",
+		"membershipGeneration",
+		"spaceGeneration",
+		"scopeGeneration",
+		"readGlobal",
+	])) return undefined;
+	if (
+		typeof value.parentSessionKey !== "string" || !value.parentSessionKey
+		|| typeof value.parentSessionId !== "string" || !UUID_PATTERN.test(value.parentSessionId)
+		|| typeof value.parentSessionPath !== "string" || !path.isAbsolute(value.parentSessionPath)
+		|| typeof value.scopeKey !== "string" || !value.scopeKey
+		|| typeof value.spaceId !== "string" || !value.spaceId
+		|| !Number.isSafeInteger(value.membershipGeneration) || Number(value.membershipGeneration) < 0
+		|| !Number.isSafeInteger(value.spaceGeneration) || Number(value.spaceGeneration) < 0
+		|| !Number.isSafeInteger(value.scopeGeneration) || Number(value.scopeGeneration) < 0
+		|| typeof value.readGlobal !== "boolean"
+	) return undefined;
+	return {
+		parentSessionKey: value.parentSessionKey,
+		parentSessionId: value.parentSessionId,
+		parentSessionPath: value.parentSessionPath,
+		scopeKey: value.scopeKey,
+		spaceId: value.spaceId,
+		membershipGeneration: value.membershipGeneration as number,
+		spaceGeneration: value.spaceGeneration as number,
+		scopeGeneration: value.scopeGeneration as number,
+		readGlobal: value.readGlobal,
+	};
+}
+
+function memoryAuthorizationResponse(value: unknown): MemoryAuthorizationResponse | undefined {
+	if (!plainObject(value) || !hasOnlyKeys(value, ["version", "parentAssignment", "activeSpaceReadGrant"])) return undefined;
+	if (value.version !== MEMORY_AUTHORIZATION_VERSION || !["global", "space", "disabled", "unavailable"].includes(String(value.parentAssignment))) return undefined;
+	const parentAssignment = value.parentAssignment as ParentMemoryAssignment;
+	const grant = value.activeSpaceReadGrant === undefined ? undefined : activeSpaceReadGrant(value.activeSpaceReadGrant);
+	if ((parentAssignment === "space") !== Boolean(grant)) return undefined;
+	return {
+		version: MEMORY_AUTHORIZATION_VERSION,
+		parentAssignment,
+		...(grant ? { activeSpaceReadGrant: grant } : {}),
+	};
+}
+
+function childMemoryBootstrap(value: unknown): ChildMemoryBootstrap | undefined {
+	if (!plainObject(value) || !hasOnlyKeys(value, ["version", "bootstrapId", "mode", "grant"])) return undefined;
+	if (value.version !== MEMORY_AUTHORIZATION_VERSION || typeof value.bootstrapId !== "string" || !UUID_PATTERN.test(value.bootstrapId) || (value.mode !== "global" && value.mode !== "active-space")) return undefined;
+	const grant = value.grant === undefined ? undefined : activeSpaceReadGrant(value.grant);
+	if ((value.mode === "active-space") !== Boolean(grant)) return undefined;
+	return {
+		version: MEMORY_AUTHORIZATION_VERSION,
+		bootstrapId: value.bootstrapId,
+		mode: value.mode,
+		...(grant ? { grant } : {}),
+	};
+}
+
+function memoryBootstrapForAttempt(captured: CapturedMemoryBootstrap): ChildMemoryBootstrap {
+	return {
+		version: MEMORY_AUTHORIZATION_VERSION,
+		bootstrapId: randomUUID(),
+		mode: captured.mode,
+		...(captured.grant ? { grant: { ...captured.grant } } : {}),
+	};
+}
+
+function verifyChildMemoryHello(
+	event: Extract<ChildProgressEvent, { type: "hello" }>,
+	expected: ChildMemoryBootstrap | undefined,
+	required: boolean,
+): void {
+	if (!expected) {
+		if (event.memory !== "off" || event.memoryScope !== undefined || event.memoryBootstrapId !== undefined) {
+			throw new SubagentFailure("subagent_memory_bootstrap_mismatch", "Child reported a memory bootstrap that the parent did not request");
+		}
+		return;
+	}
+	if (event.memoryScope !== expected.mode || event.memoryBootstrapId !== expected.bootstrapId) {
+		throw new SubagentFailure("subagent_memory_bootstrap_mismatch", `Child memory bootstrap does not match requested ${expected.mode} bootstrap ${expected.bootstrapId}`);
+	}
+	if (required && event.memory !== "read") {
+		throw new SubagentFailure("subagent_memory_unavailable", `Required ${expected.mode} memory was unavailable in the child`);
+	}
+}
+
 function readChildSpec(): ChildSpec {
 	const specPath = process.env[CHILD_SPEC_ENV];
 	if (!specPath) throw new Error(`${CHILD_SPEC_ENV} is required in child mode`);
@@ -2113,8 +2260,24 @@ function parseChildProgress(line: string): ChildProgressEvent {
 	if (!event || typeof event !== "object" || !["hello", "reject", "heartbeat", "reasoning", "continuation", "compaction_start", "compaction_end", "tool_start", "tool_end", "turn_end", "structured_output", "terminal"].includes(event.type)) {
 		throw new SubagentFailure("subagent_progress_malformed", "Child emitted an unknown progress event");
 	}
-	if (event.type === "hello" && (typeof event.version !== "number" || typeof event.model !== "string" || typeof event.api !== "string" || typeof event.thinking !== "string" || !["priority", "off"].includes(event.fastMode) || !["off", "read"].includes(event.memory) || event.watchdog !== "active" || !["active", "off"].includes(event.writerLease) || (event.schemaHash !== undefined && !/^[0-9a-f]{64}$/.test(event.schemaHash)))) {
-		throw new SubagentFailure("subagent_progress_malformed", "Child emitted an invalid hello event");
+	if (event.type === "hello") {
+		const hasMemoryScope = event.memoryScope !== undefined;
+		const hasMemoryBootstrapId = event.memoryBootstrapId !== undefined;
+		if (
+			typeof event.version !== "number"
+			|| typeof event.model !== "string"
+			|| typeof event.api !== "string"
+			|| typeof event.thinking !== "string"
+			|| !["priority", "off"].includes(event.fastMode)
+			|| !["off", "read"].includes(event.memory)
+			|| hasMemoryScope !== hasMemoryBootstrapId
+			|| (hasMemoryScope && event.memoryScope !== "global" && event.memoryScope !== "active-space")
+			|| (hasMemoryBootstrapId && (typeof event.memoryBootstrapId !== "string" || !UUID_PATTERN.test(event.memoryBootstrapId)))
+			|| (event.memory === "read" && !hasMemoryScope)
+			|| event.watchdog !== "active"
+			|| !["active", "off"].includes(event.writerLease)
+			|| (event.schemaHash !== undefined && !/^[0-9a-f]{64}$/.test(event.schemaHash))
+		) throw new SubagentFailure("subagent_progress_malformed", "Child emitted an invalid hello event");
 	}
 	if (event.type === "reject" && (typeof event.version !== "number" || typeof event.errorCode !== "string" || typeof event.message !== "string")) {
 		throw new SubagentFailure("subagent_progress_malformed", "Child emitted an invalid reject event");
@@ -2459,15 +2622,40 @@ function childExtension(pi: ExtensionAPI, spec: ChildSpec): void {
 			}
 		}
 		let memory: MemoryMode = "off";
+		let memoryBootstrap: ChildMemoryBootstrap | undefined;
 		if (spec.memoryRequested) {
-			const memoryStatus = readChildMemoryStatus(pi);
-			if (memoryStatus?.status === "ready") memory = "read";
-			else if (spec.memoryRequired) {
-				await rejectStartup("subagent_memory_unavailable", memoryStatus?.message || "Required read-only memory failed to initialize in the child");
+			memoryBootstrap = childMemoryBootstrap(spec.memoryBootstrap);
+			if (!memoryBootstrap) {
+				await rejectStartup("subagent_memory_bootstrap_mismatch", "Child memory bootstrap specification is missing or invalid");
 			}
+			const memoryStatus = readChildMemoryStatus(pi);
+			if (!memoryStatus) {
+				await rejectStartup("subagent_memory_unavailable", "Read-only memory did not report child bootstrap status");
+			}
+			if (memoryStatus.memoryScope !== memoryBootstrap.mode || memoryStatus.memoryBootstrapId !== memoryBootstrap.bootstrapId) {
+				await rejectStartup("subagent_memory_bootstrap_mismatch", `Memory extension did not confirm requested ${memoryBootstrap.mode} bootstrap ${memoryBootstrap.bootstrapId}`);
+			}
+			if (memoryStatus.status === "ready") memory = "read";
+			else if (spec.memoryRequired) {
+				await rejectStartup("subagent_memory_unavailable", memoryStatus.message || "Required read-only memory failed to initialize in the child");
+			}
+		} else if (spec.memoryRequired || spec.memoryBootstrap !== undefined) {
+			await rejectStartup("subagent_memory_bootstrap_mismatch", "Child memory bootstrap was supplied while memory was disabled");
 		}
 		ready = true;
-		await appendProgress({ type: "hello", version: CHILD_PROTOCOL_VERSION, model: actualModel, api: actualApi!, thinking: actualThinking, fastMode: spec.fastMode, memory, watchdog: "active", writerLease, ...(schemaHash ? { schemaHash } : {}) });
+		await appendProgress({
+			type: "hello",
+			version: CHILD_PROTOCOL_VERSION,
+			model: actualModel,
+			api: actualApi!,
+			thinking: actualThinking,
+			fastMode: spec.fastMode,
+			memory,
+			...(memoryBootstrap ? { memoryScope: memoryBootstrap.mode, memoryBootstrapId: memoryBootstrap.bootstrapId } : {}),
+			watchdog: "active",
+			writerLease,
+			...(schemaHash ? { schemaHash } : {}),
+		});
 	});
 
 	pi.on("before_provider_request", (event, ctx) => {
@@ -3104,7 +3292,54 @@ function extensionPath(): string {
 	return fs.realpathSync(fileURLToPath(import.meta.url));
 }
 
-function discoverExtensionCapabilities(pi: ExtensionAPI, target?: { provider: string; api: string }): ExtensionCapability[] {
+function persistedParentSessionIdentity(sessionFile: string | undefined): ParentSessionIdentity {
+	if (!sessionFile) {
+		throw new SubagentFailure("subagent_memory_unavailable", "Explicit read-only memory requires an active persisted parent session");
+	}
+	let canonicalPath: string;
+	let handle: number | undefined;
+	try {
+		canonicalPath = fs.realpathSync(sessionFile);
+		handle = fs.openSync(canonicalPath, "r");
+		if (!fs.fstatSync(handle).isFile()) throw new Error("session path is not a regular file");
+		const chunks: Buffer[] = [];
+		let bytes = 0;
+		let complete = false;
+		while (bytes < SESSION_HEADER_MAX_BYTES) {
+			const buffer = Buffer.allocUnsafe(Math.min(64 * 1024, SESSION_HEADER_MAX_BYTES - bytes));
+			const read = fs.readSync(handle, buffer, 0, buffer.length, null);
+			if (read === 0) {
+				complete = true;
+				break;
+			}
+			const newline = buffer.indexOf(0x0a, 0);
+			if (newline >= 0 && newline < read) {
+				chunks.push(buffer.subarray(0, newline));
+				complete = true;
+				break;
+			}
+			chunks.push(buffer.subarray(0, read));
+			bytes += read;
+		}
+		if (!complete) throw new Error(`session header exceeds ${SESSION_HEADER_MAX_BYTES} bytes`);
+		const header = JSON.parse(Buffer.concat(chunks).toString("utf8")) as unknown;
+		if (!plainObject(header) || header.type !== "session" || typeof header.id !== "string" || !UUID_PATTERN.test(header.id)) {
+			throw new Error("session header does not contain a UUID identity");
+		}
+		return { path: canonicalPath, id: header.id };
+	} catch (error) {
+		if (error instanceof SubagentFailure) throw error;
+		throw new SubagentFailure("subagent_memory_unavailable", `Unable to authorize read-only memory from the active parent session: ${error instanceof Error ? error.message : String(error)}`);
+	} finally {
+		if (handle !== undefined) fs.closeSync(handle);
+	}
+}
+
+function discoverExtensionCapabilities(
+	pi: ExtensionAPI,
+	target?: { provider: string; api: string },
+	memoryAuthorization?: MemoryAuthorizationRequest,
+): ExtensionCapability[] {
 	const eventBus = (pi as ExtensionAPI & { events?: ExtensionAPI["events"] }).events;
 	if (!eventBus?.on) return [];
 	const requestId = randomUUID();
@@ -3121,6 +3356,7 @@ function discoverExtensionCapabilities(pi: ExtensionAPI, target?: { provider: st
 			|| (kind === "read-only-tools" && (!Array.isArray(candidate.tools) || candidate.tools.length === 0 || candidate.tools.some((tool) => typeof tool !== "string" || !tool.trim())))
 			|| (kind === "fast-mode" && candidate.fastMode !== "priority" && candidate.fastMode !== "off")
 		) return;
+		const authorization = kind === "memory-read" ? memoryAuthorizationResponse(candidate.memoryAuthorization) : undefined;
 		capabilities.push({
 			version: CAPABILITY_VERSION,
 			requestId,
@@ -3129,10 +3365,16 @@ function discoverExtensionCapabilities(pi: ExtensionAPI, target?: { provider: st
 			...(kind === "provider" ? { provider: candidate.provider as string } : {}),
 			...(kind === "read-only-tools" ? { tools: [...new Set(candidate.tools as string[])] } : {}),
 			...(kind === "fast-mode" ? { fastMode: candidate.fastMode as "priority" | "off" } : {}),
+			...(authorization ? { memoryAuthorization: authorization } : {}),
 		});
 	});
 	try {
-		eventBus.emit(CAPABILITY_REQUEST_CHANNEL, { version: CAPABILITY_VERSION, requestId, ...(target ? { target } : {}) });
+		eventBus.emit(CAPABILITY_REQUEST_CHANNEL, {
+			version: CAPABILITY_VERSION,
+			requestId,
+			...(target ? { target } : {}),
+			...(memoryAuthorization ? { memoryAuthorization } : {}),
+		});
 	} finally {
 		stop();
 	}
@@ -3151,7 +3393,12 @@ function canonicalCapabilityPaths(capabilities: ExtensionCapability[], predicate
 	return paths;
 }
 
-function resolveMemoryReadCapability(pi: ExtensionAPI, requested: MemoryMode | undefined, agentType: string): MemoryReadCapability | undefined {
+function resolveMemoryReadCapability(
+	pi: ExtensionAPI,
+	requested: MemoryMode | undefined,
+	agentType: string,
+	parentSessionFile?: string,
+): MemoryReadCapability | undefined {
 	const shouldRead = requested === "read" || (requested === undefined && agentType !== REVIEWER);
 	if (!shouldRead) return undefined;
 	const explicit = requested === "read";
@@ -3163,9 +3410,51 @@ function resolveMemoryReadCapability(pi: ExtensionAPI, requested: MemoryMode | u
 	const paths = canonicalCapabilityPaths(discoverExtensionCapabilities(pi), (capability) => capability.kind === "memory-read");
 	if (paths.length > 1) throw new SubagentFailure("subagent_memory_ambiguous", "Multiple extensions advertise read-only memory");
 	const [extensionPath] = paths;
-	if (extensionPath) return { version: CAPABILITY_VERSION, extensionPath };
-	if (explicit) throw new SubagentFailure("subagent_memory_unavailable", "Read-only memory requires an enabled compatible memory extension");
-	return undefined;
+	if (!extensionPath) {
+		if (explicit) throw new SubagentFailure("subagent_memory_unavailable", "Read-only memory requires an enabled compatible memory extension");
+		return undefined;
+	}
+	if (!explicit) {
+		return { version: CAPABILITY_VERSION, extensionPath, memoryBootstrap: { mode: "global" } };
+	}
+
+	const parentSession = persistedParentSessionIdentity(parentSessionFile);
+	const request: MemoryAuthorizationRequest = {
+		version: MEMORY_AUTHORIZATION_VERSION,
+		parentSessionPath: parentSession.path,
+		parentSessionId: parentSession.id,
+	};
+	const authorizations = new Map<string, MemoryAuthorizationResponse>();
+	for (const capability of discoverExtensionCapabilities(pi, undefined, request)) {
+		if (capability.kind !== "memory-read" || !capability.memoryAuthorization) continue;
+		let candidatePath: string;
+		try {
+			candidatePath = fs.realpathSync(capability.extensionPath);
+		} catch {
+			continue;
+		}
+		if (candidatePath !== extensionPath) continue;
+		authorizations.set(JSON.stringify(capability.memoryAuthorization), capability.memoryAuthorization);
+	}
+	if (authorizations.size !== 1) {
+		throw new SubagentFailure("subagent_memory_unavailable", "Memory extension did not return one valid authorization for the active parent session");
+	}
+	const authorization = authorizations.values().next().value!;
+	if (authorization.parentAssignment === "disabled" || authorization.parentAssignment === "unavailable") {
+		throw new SubagentFailure("subagent_memory_unavailable", `Read-only memory is ${authorization.parentAssignment} for the active parent session`);
+	}
+	if (authorization.parentAssignment === "global") {
+		return { version: CAPABILITY_VERSION, extensionPath, memoryBootstrap: { mode: "global" } };
+	}
+	const grant = authorization.activeSpaceReadGrant;
+	if (!grant || grant.parentSessionPath !== parentSession.path || grant.parentSessionId !== parentSession.id) {
+		throw new SubagentFailure("subagent_memory_unavailable", "Memory extension returned an active-space grant for a different parent session");
+	}
+	return {
+		version: CAPABILITY_VERSION,
+		extensionPath,
+		memoryBootstrap: { mode: "active-space", grant },
+	};
 }
 
 function resolveProviderExtensionPaths(pi: ExtensionAPI, provider: string): string[] {
@@ -3250,9 +3539,19 @@ function readChildMemoryStatus(pi: ExtensionAPI): ChildIntegrationStatus | undef
 			|| candidate.requestId !== requestId
 			|| candidate.kind !== "memory-read"
 			|| (candidate.status !== "ready" && candidate.status !== "unavailable")
+			|| (candidate.memoryScope !== undefined && candidate.memoryScope !== "global" && candidate.memoryScope !== "active-space")
+			|| (candidate.memoryBootstrapId !== undefined && typeof candidate.memoryBootstrapId !== "string")
 			|| (candidate.message !== undefined && typeof candidate.message !== "string")
 		) return;
-		status ??= candidate as unknown as ChildIntegrationStatus;
+		status ??= {
+			version: CAPABILITY_VERSION,
+			requestId,
+			kind: "memory-read",
+			status: candidate.status,
+			...(candidate.memoryScope ? { memoryScope: candidate.memoryScope } : {}),
+			...(candidate.memoryBootstrapId ? { memoryBootstrapId: candidate.memoryBootstrapId } : {}),
+			...(candidate.message ? { message: candidate.message } : {}),
+		};
 	});
 	try {
 		pi.events.emit(CHILD_STATUS_REQUEST_CHANNEL, { version: CAPABILITY_VERSION, requestId });
@@ -3582,6 +3881,10 @@ export const __subagentTest = {
 	mixedMutationToolCallIds,
 	invalidWorkflowBatchToolCallIds,
 	parseChildProgress,
+	activeSpaceReadGrant,
+	persistedParentSessionIdentity,
+	memoryBootstrapForAttempt,
+	verifyChildMemoryHello,
 	substantiveMessageUpdate,
 	subagentWatchdogSettings,
 	terminateProcess,
@@ -3973,7 +4276,8 @@ export default function subagent(pi: ExtensionAPI): void {
 			? { ...baseDefinition, systemPrompt: `${baseDefinition.systemPrompt}\n\n${workflowInstruction}` }
 			: baseDefinition;
 		const context: AgentContext = params.context ?? "fresh";
-		const parentSessionFile = context === "parent" ? ctx.sessionManager.getSessionFile() : undefined;
+		const activeParentSessionFile = ctx.sessionManager.getSessionFile();
+		const parentSessionFile = context === "parent" ? activeParentSessionFile : undefined;
 		if (context === "parent" && !parentSessionFile) {
 			throw new SubagentFailure("subagent_parent_context_unavailable", "Parent context requires a persisted parent session");
 		}
@@ -3989,7 +4293,7 @@ export default function subagent(pi: ExtensionAPI): void {
 		}
 		const thinking = resolveThinking(params.thinking ?? definition.thinking, pi.getThinkingLevel(), model);
 		const fastMode = resolveFastMode(pi, model);
-		const memoryCapability = resolveMemoryReadCapability(pi, params.memory, params.subagent_type);
+		const memoryCapability = resolveMemoryReadCapability(pi, params.memory, params.subagent_type, activeParentSessionFile);
 		const providerExtensionPaths = resolveProviderExtensionPaths(pi, model.provider);
 		const outputSchema = params.schema === undefined ? undefined : validateOutputSchema(params.schema);
 		const readOnlyToolExtensions = resolveReadOnlyToolExtensions(pi);
@@ -4292,6 +4596,8 @@ export default function subagent(pi: ExtensionAPI): void {
 			let outputLimitExceeded = false;
 			let processError: Error | undefined;
 			let attemptFailure: SubagentFailure | undefined;
+			let attemptSpecPath: string | undefined;
+			let expectedMemoryBootstrap: ChildMemoryBootstrap | undefined;
 			let childStart = 0;
 			const maxChildStarts = watchdog.retries + 1;
 			let firstActionObserved = false;
@@ -4325,6 +4631,16 @@ export default function subagent(pi: ExtensionAPI): void {
 			const clearAttemptTimers = () => {
 				clearStartTimer();
 				clearFirstActionTimer();
+			};
+			const removeAttemptSpec = () => {
+				if (!attemptSpecPath) return;
+				const current = attemptSpecPath;
+				try {
+					fs.rmSync(current, { force: true });
+					attemptSpecPath = undefined;
+				} catch (error) {
+					throw new SubagentFailure("subagent_cleanup_failed", `Unable to remove child attempt specification: ${error instanceof Error ? error.message : String(error)}`);
+				}
 			};
 			const failAttempt = (failure: SubagentFailure, activity: string) => {
 				if (attemptFailure || parentAborted || record.abortController.signal.aborted) return;
@@ -4368,9 +4684,14 @@ export default function subagent(pi: ExtensionAPI): void {
 				if (attemptFailure) return;
 				if (!helloReceived) {
 					if (event.type === "reject") {
-						clearStartTimer();
+						if (event.version !== CHILD_PROTOCOL_VERSION) {
+							throw new SubagentFailure("subagent_protocol_mismatch", `Child protocol ${event.version} does not match parent protocol ${CHILD_PROTOCOL_VERSION}. Run /reload in this Pi session before retrying.`);
+						}
+						clearAttemptTimers();
+						removeAttemptSpec();
 						record.errorCode = event.errorCode;
 						record.error = event.message;
+						void terminateProcess(record).catch((error) => rejectProcessWait?.(error));
 						return;
 					}
 					if (event.type !== "hello") throw new SubagentFailure("subagent_progress_malformed", "Child progress did not begin with hello");
@@ -4384,6 +4705,8 @@ export default function subagent(pi: ExtensionAPI): void {
 					if (event.schemaHash !== outputSchema?.hash) throw new SubagentFailure("subagent_protocol_mismatch", "Child structured-output schema does not match the parent request");
 					const expectedWriterLease = writeCapable ? "active" : "off";
 					if (event.writerLease !== expectedWriterLease) throw new SubagentFailure("subagent_protocol_mismatch", `Child writer lease state ${event.writerLease} does not match expected ${expectedWriterLease}`);
+					verifyChildMemoryHello(event, expectedMemoryBootstrap, params.memory === "read");
+					removeAttemptSpec();
 					record.memory = event.memory;
 					helloReceived = true;
 					clearStartTimer();
@@ -4525,8 +4848,7 @@ export default function subagent(pi: ExtensionAPI): void {
 				await fs.promises.chmod(temporaryDirectory, 0o700);
 				const finalOutputPath = path.join(temporaryDirectory, "final-output.txt");
 				const structuredOutputPath = path.join(temporaryDirectory, STRUCTURED_OUTPUT_FILE);
-				const specPath = path.join(temporaryDirectory, "child.json");
-				const spec: ChildSpec = {
+				const baseSpec: ChildSpec = {
 					protocolVersion: CHILD_PROTOCOL_VERSION,
 					progressFd: CHILD_PROGRESS_FD,
 					watchdogFd: CHILD_WATCHDOG_FD,
@@ -4544,7 +4866,6 @@ export default function subagent(pi: ExtensionAPI): void {
 					...(Object.keys(requiredToolOwners).length > 0 ? { requiredToolOwners } : {}),
 					...(outputSchema ? { outputSchema: outputSchema.schema, outputSchemaHash: outputSchema.hash, structuredOutputPath } : {}),
 				};
-				await fs.promises.writeFile(specPath, JSON.stringify(spec), { encoding: "utf8", mode: 0o600 });
 
 				const args = ["--mode", "text", "-p"];
 				if (context === "parent") {
@@ -4573,16 +4894,6 @@ export default function subagent(pi: ExtensionAPI): void {
 				args.push(delegatedTask);
 
 				const invocation = getPiInvocation(args);
-				const childEnv = { ...process.env };
-				delete childEnv[CHILD_ENV];
-				delete childEnv[CHILD_SPEC_ENV];
-				delete childEnv[MEMORY_CHILD_READ_ONLY_ENV];
-				Object.assign(childEnv, {
-					GIT_OPTIONAL_LOCKS: "0",
-					[CHILD_ENV]: "1",
-					[CHILD_SPEC_ENV]: specPath,
-					...(memoryCapability ? { [MEMORY_CHILD_READ_ONLY_ENV]: "1" } : {}),
-				});
 				ensureNotStopped();
 				record.status = "running";
 				let exitCode = 1;
@@ -4619,6 +4930,25 @@ export default function subagent(pi: ExtensionAPI): void {
 					outputLimitExceeded = false;
 					processError = undefined;
 					clearAttemptTimers();
+					expectedMemoryBootstrap = memoryCapability ? memoryBootstrapForAttempt(memoryCapability.memoryBootstrap) : undefined;
+					attemptSpecPath = path.join(temporaryDirectory, `child-${childStart}-${randomUUID()}.json`);
+					const spec: ChildSpec = {
+						...baseSpec,
+						...(expectedMemoryBootstrap ? { memoryBootstrap: expectedMemoryBootstrap } : {}),
+					};
+					await fs.promises.writeFile(attemptSpecPath, JSON.stringify(spec), { encoding: "utf8", flag: "wx", mode: 0o600 });
+					await fs.promises.chmod(attemptSpecPath, 0o600);
+					const childEnv = { ...process.env };
+					delete childEnv[CHILD_ENV];
+					delete childEnv[CHILD_SPEC_ENV];
+					delete childEnv[MEMORY_CHILD_READ_ONLY_ENV];
+					Object.assign(childEnv, {
+						GIT_OPTIONAL_LOCKS: "0",
+						[CHILD_ENV]: "1",
+						[CHILD_SPEC_ENV]: attemptSpecPath,
+						...(memoryCapability ? { [MEMORY_CHILD_READ_ONLY_ENV]: "1" } : {}),
+					});
+					ensureNotStopped();
 					record.activity = childStart === 1
 						? "Starting Pi…"
 						: `Restarting the same agent (attempt ${childStart}/${maxChildStarts})…`;
@@ -4712,6 +5042,7 @@ export default function subagent(pi: ExtensionAPI): void {
 					record.exitCode = exitCode;
 					await terminateProcess(record);
 					await Promise.all([finalOutputFinished, progressFinished]);
+					removeAttemptSpec();
 					if (parentAborted || shuttingDown) ensureNotStopped();
 					if (outputLimitExceeded) throw new SubagentFailure("subagent_output_limit", record.error ?? "Child output exceeded its limit");
 					if (finalOutputError) throw new SubagentFailure("subagent_output_persist_failed", finalOutputError.message);
@@ -4799,9 +5130,16 @@ export default function subagent(pi: ExtensionAPI): void {
 				finalOutputStream?.destroy();
 				let cleanupFailure: SubagentFailure | undefined;
 				try {
-					await releaseWriterLeaseAfterQuiescence(record.termination, lease);
+					removeAttemptSpec();
 				} catch (error) {
 					cleanupFailure = error instanceof SubagentFailure
+						? error
+						: new SubagentFailure("subagent_cleanup_failed", error instanceof Error ? error.message : String(error));
+				}
+				try {
+					await releaseWriterLeaseAfterQuiescence(record.termination, lease);
+				} catch (error) {
+					cleanupFailure ??= error instanceof SubagentFailure
 						? error
 						: new SubagentFailure("subagent_writer_lease_release_failed", error instanceof Error ? error.message : String(error));
 				}
