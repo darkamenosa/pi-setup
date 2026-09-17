@@ -78,7 +78,7 @@ function registerSubagentToolCapability(pi: ExtensionAPI): void {
 		});
 	});
 }
-const DEFAULT_VISION_MODEL = process.env.CODEX_VISION_MODEL || "gpt-5.4-mini";
+const DEFAULT_VISION_MODEL = process.env.CODEX_VISION_MODEL || "gpt-5.6-luna";
 const MAX_IMAGES_PER_REQUEST = positiveEnvironmentInteger("CODEX_VISION_MAX_IMAGES", 8);
 const MAX_IMAGE_BYTES = positiveEnvironmentInteger("CODEX_VISION_MAX_IMAGE_BYTES", 20 * 1024 * 1024);
 const IMAGE_STORE_DIR = process.env.CODEX_VISION_STORE_DIR || join(homedir(), ".pi", "agent", "codex-vision", "images");
