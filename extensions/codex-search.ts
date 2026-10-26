@@ -179,7 +179,7 @@ function registerSubagentToolCapability(pi: ExtensionAPI): void {
 		});
 	});
 }
-const DEFAULT_SEARCH_MODEL = process.env.CODEX_SEARCH_MODEL || "gpt-5.4-mini";
+const DEFAULT_SEARCH_MODEL = process.env.CODEX_SEARCH_MODEL || "gpt-6-luna";
 const OUTPUT_DIR = process.env.CODEX_SEARCH_OUTPUT_DIR || join(homedir(), ".pi", "agent", "codex-search", "outputs");
 
 interface CodexSearchResponse {
