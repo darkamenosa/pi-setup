@@ -18,8 +18,8 @@
  * - The side call runs on the session model (`ctx.model`), the way
  *   `model.fork` does. There is no hidden small model.
  * - Ignored cards back off: two in a row starts skipping checks, up to 16.
- * - The explained card can be rewritten in simpler words or more detail, and
- *   saved as a local Markdown page.
+ * - The explained card offers the primary actions only. Rewrite and page
+ *   actions are not exposed from the card.
  *
  * Usage:
  *   /reload
@@ -413,10 +413,6 @@ function pageParts(file: string): { slug: string; stamp: string } {
 	};
 }
 
-function pageSlug(file: string): string {
-	return pageParts(file).slug;
-}
-
 function pageLabel(file: string): string {
 	const { slug, stamp } = pageParts(file);
 	return stamp ? `${stamp} ${slug}` : slug;
@@ -782,11 +778,7 @@ function choicesFor(card: Card, busy: BusyKind): ChoiceSet {
 			{ key: "2", label: "Chat in main session", action: "chat" },
 			{ key: "0", label: "Dismiss", action: "dismiss" },
 		],
-		secondary: [
-			{ key: "3", label: "Simpler words", action: "simpler" },
-			{ key: "4", label: "More detail", action: "detail" },
-			{ key: "5", label: card.pagePath ? "Update page" : "Make a page", action: "page" },
-		],
+		secondary: [],
 	};
 }
 
@@ -971,10 +963,9 @@ class NoteCard implements Component {
 			return lines;
 		}
 
-		const pageLines = card.pagePath ? 2 : 0;
 		const busyLines = busy ? 2 : 0;
 		const fixed =
-			lines.length + 1 + pageLines + busyLines + 1 + primary.lines.length + secondary.lines.length;
+			lines.length + 1 + busyLines + 1 + primary.lines.length + secondary.lines.length;
 		const available = Math.max(3, this.maxRows() - fixed);
 		const explanation = renderExplanation(
 			this.theme,
@@ -985,10 +976,6 @@ class NoteCard implements Component {
 
 		lines.push("");
 		lines.push(...explanation);
-		if (card.pagePath) {
-			lines.push("");
-			lines.push(truncateToWidth(`  ${this.theme.fg("dim", `Page saved: ${pageSlug(card.pagePath)}`)}`, width));
-		}
 		if (busy) {
 			lines.push("");
 			lines.push(
